@@ -1,7 +1,8 @@
 #include "wled.h"
+#include "src/font/old fonts/console_font_5x8.h"
 
 /*
- * CubeConnect button-flash scaffold for this WLED 17 checkout.
+ * CubeConnect scrolling-menu scaffold for this WLED 17 checkout.
  * Wire a normally-open momentary button between the configured GPIO and GND.
  *
  * References: https://github.com/wled/wled-usermod-example
@@ -15,7 +16,33 @@
 class CubeConnectUsermod : public Usermod {
 private:
   static constexpr uint32_t DEBOUNCE_MS = 35;
+  static constexpr uint32_t LONG_PRESS_MS = 800;
+  static constexpr size_t MAX_TEXT = 96;
+  struct TextScreen {
+    char text[MAX_TEXT + 1];
+    char color[8]; // HTML color picker format: #RRGGBB
+    uint32_t rgb;
+  };
+  TextScreen _intro = {"Menu", "#FFFFFF", 0xFFFFFF};
+  TextScreen _messages[2] = {
+    {"1. some sample message 1", "#FFFFFF", 0xFFFFFF},
+    {"2. sample text 2", "#FFFFFF", 0xFFFFFF}
+  };
+  uint8_t _scrollSpeed = 11; // columns per second, shared by all text screens
+  bool _textConfigPending = false;
+  static constexpr uint8_t MATRIX_WIDTH = 8;
+  static constexpr uint8_t MATRIX_HEIGHT = 8;
+  static constexpr uint8_t MESSAGE_COUNT = 2;
   static constexpr uint32_t PHASE_MS = 250;
+  enum class Screen : uint8_t { Idle, Intro, Browse, Confirm };
+  Screen _screen = Screen::Idle;
+  uint8_t _message = 0;
+  int16_t _scrollX = MATRIX_WIDTH;
+  uint32_t _scrollAt = 0;
+  bool _scrollShown = false;
+  bool _pressAccepted = false;
+  bool _longHandled = false;
+  uint32_t _pressedAt = 0;
   static constexpr uint8_t PHASE_COUNT = 6; // red, black, red, black, red, black
   // Private out-of-tree ID, unused in this checkout. Keep below 0x80 (core IDs).
   // Reserve a public ID with WLED before combining with unrelated external mods.
@@ -36,15 +63,15 @@ private:
   bool _stablePressed = false;
   uint32_t _rawChangedAt = 0;
 
-  bool _flashing = false;
   bool _phaseShown = false;
   uint8_t _phase = 0;
   uint32_t _phaseStartedAt = 0;
 
   // Request a normal composed frame; there is no preset or segment to restore.
-  void stopFlash() {
-    if (!_flashing) return;
-    _flashing = false;
+  void stopDisplay() {
+    if (_screen == Screen::Idle) return;
+    _screen = Screen::Idle;
+    _pressAccepted = false;
     _phaseShown = false;
     strip.trigger();
   }
@@ -52,7 +79,7 @@ private:
   // Apply hardware changes in setup/loop, never inside a settings callback.
   void configureButton() {
     _configPending = false;
-    stopFlash();
+    stopDisplay();
     if (_allocatedPin >= 0) {
       pinMode(_allocatedPin, INPUT);
       PinManager::deallocatePin(_allocatedPin, PIN_OWNER);
@@ -78,15 +105,141 @@ private:
     // A button held at boot/reconfiguration must be released before triggering.
     _rawPressed = _stablePressed = digitalRead(_allocatedPin) == LOW;
     _rawChangedAt = millis();
+    _pressAccepted = false;
+    _longHandled = false;
+  }
+
+  // Restart a scroll on entry or selection change; intro scrolls once, messages loop.
+  void startScroll(Screen screen) {
+    _screen = screen;
+    _scrollX = MATRIX_WIDTH;
+    _scrollShown = false;
+    strip.trigger();
+  }
+
+  // Placeholder for a future transport. No message is actually transmitted yet.
+  void confirmMessage() {
+    _screen = Screen::Confirm;
+    _phase = 0;
+    _phaseShown = false;
+    strip.trigger();
+  }
+
+  void handleLongPress() {
+    if (_screen == Screen::Idle) {
+      _message = 0;
+      startScroll(Screen::Intro);
+    } else if (_screen == Screen::Browse) {
+      confirmMessage();
+    }
+  }
+
+  void handleClick() {
+    if (_screen == Screen::Browse) {
+      _message = (_message + 1) % MESSAGE_COUNT;
+      startScroll(Screen::Browse);
+    }
+  }
+
+  const TextScreen& currentTextScreen() const {
+    return _screen == Screen::Intro ? _intro : _messages[_message];
+  }
+
+  const char* scrollingText() const { return currentTextScreen().text; }
+  uint32_t scrollInterval() const { return 1000U / _scrollSpeed; }
+
+  // Keep strings bounded and compatible with the bundled printable-ASCII font.
+  // Missing/invalid values retain the previous settings (defaults on first boot).
+  bool readTextScreen(JsonObject obj, TextScreen& screen) {
+    bool complete = true;
+    const char* text = obj["text"].as<const char*>();
+    if (!text) complete = false;
+    else {
+      char value[MAX_TEXT + 1];
+      size_t n = 0;
+      bool visible = false;
+      while (n < MAX_TEXT && text[n]) {
+        const uint8_t ch = static_cast<uint8_t>(text[n]);
+        value[n] = ch >= 32 && ch <= 126 ? char(ch) : '?';
+        if (value[n] != text[n]) complete = false;
+        visible |= value[n] != ' ';
+        ++n;
+      }
+      value[n] = '\0';
+      if (text[n]) complete = false; // truncate overlong input before copying
+      if (visible) {
+        if (strcmp(screen.text, value)) _textConfigPending = true;
+        memcpy(screen.text, value, n + 1);
+      } else complete = false;
+    }
+
+    const char* color = obj["color"].as<const char*>();
+    bool valid = color && strnlen(color, 8) == 7 && color[0] == '#';
+    uint32_t rgb = 0;
+    if (valid) for (uint8_t i = 1; i <= 6; ++i) {
+      const char c = color[i];
+      int digit = c >= '0' && c <= '9' ? c - '0'
+                : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+      if (digit < 0) { valid = false; break; }
+      rgb = (rgb << 4) | uint32_t(digit);
+    }
+    if (valid) {
+      if (screen.rgb != rgb) _textConfigPending = true;
+      screen.rgb = rgb;
+      memcpy(screen.color, color, sizeof(screen.color));
+    } else complete = false;
+    return complete;
+  }
+
+  void saveTextScreen(JsonObject obj, const TextScreen& screen) {
+    obj["text"] = screen.text;
+    obj["color"] = screen.color;
+  }
+
+  // Draw WLED's fixed 5x8 WBF font directly into the output buffer. Using the
+  // segment font renderer here would modify the animation we need to preserve.
+  // Font layout: 12-byte header, ASCII 32..126, 5 bytes/glyph, row-major MSB first.
+  void drawText(const char* text) {
+    strip.fill(0);
+    int16_t cursor = _scrollX;
+    for (size_t i = 0; ; ++i, cursor += 6) {
+      const uint8_t ch = static_cast<uint8_t>(text[i]);
+      if (!ch || cursor >= MATRIX_WIDTH) break;
+      if (cursor + 5 <= 0 || ch < 32 || ch > 126) continue;
+      const uint8_t* glyph = console_font_5x8 + 12 + (ch - 32) * 5;
+      for (uint8_t y = 0; y < MATRIX_HEIGHT; ++y) {
+        for (uint8_t col = 0; col < 5; ++col) {
+          const int16_t x = cursor + col;
+          if (x < 0 || x >= MATRIX_WIDTH) continue;
+          const uint8_t bit = y * 5 + col;
+          if (pgm_read_byte(glyph + bit / 8) & (0x80 >> (bit % 8))) {
+            strip.setPixelColor(y * MATRIX_WIDTH + x, currentTextScreen().rgb);
+          }
+        }
+      }
+    }
   }
 
 public:
   void setup() override { configureButton(); }
 
-  // Debounce both edges without delays. Busy presses are consumed, not queued.
+  // Debounce both edges. Recognize clicks on release and latch each long press
+  // once, preventing the menu-entry hold from also confirming the first item.
   void loop() override {
     if (_configPending) configureButton();
+    if (_textConfigPending) {
+      stopDisplay();
+      _textConfigPending = false;
+      _pressAccepted = false;
+    }
     if (!_enabled || _allocatedPin < 0) return;
+    const bool available = !_updating && realtimeMode == REALTIME_MODE_INACTIVE
+                           && strip.getLengthTotal() >= MATRIX_WIDTH * MATRIX_HEIGHT;
+    if (!available) {
+      stopDisplay();
+      _pressAccepted = false;
+    }
 
     const uint32_t now = millis();
     const bool pressed = digitalRead(_allocatedPin) == LOW;
@@ -96,48 +249,75 @@ public:
     }
     if (_rawPressed != _stablePressed && uint32_t(now - _rawChangedAt) >= DEBOUNCE_MS) {
       _stablePressed = _rawPressed;
-      if (_stablePressed && !_flashing && !_updating && realtimeMode == REALTIME_MODE_INACTIVE) {
-        _flashing = true;
-        _phase = 0;
-        _phaseShown = false;
+      if (_stablePressed) {
+        _pressedAt = _rawChangedAt;
+        _longHandled = false;
+        _pressAccepted = available && (_screen == Screen::Idle || _screen == Screen::Browse);
+      } else {
+        if (_pressAccepted && !_longHandled) {
+          if (uint32_t(_rawChangedAt - _pressedAt) >= LONG_PRESS_MS) handleLongPress();
+          else handleClick();
+        }
+        _pressAccepted = false;
       }
     }
+    if (_stablePressed && _rawPressed && _pressAccepted && !_longHandled
+        && uint32_t(now - _pressedAt) >= LONG_PRESS_MS) {
+      _longHandled = true;
+      handleLongPress();
+    }
 
-    // Realtime streams own their buffer. Do not overwrite or interrupt them.
-    if (_updating || realtimeMode != REALTIME_MODE_INACTIVE) stopFlash();
-    if (_flashing && (!_phaseShown || uint32_t(now - _phaseStartedAt) >= PHASE_MS)) strip.trigger();
+    if (_screen == Screen::Confirm) {
+      if (!_phaseShown || uint32_t(now - _phaseStartedAt) >= PHASE_MS) strip.trigger();
+    } else if (_screen != Screen::Idle) {
+      if (!_scrollShown || uint32_t(now - _scrollAt) >= scrollInterval()) strip.trigger();
+    }
   }
 
-  // Time each phase from a rendered frame, so a slow loop cannot skip flashes.
+  // All timing advances from displayed frames, with no blocking delays or
+  // skipped scroll columns during a slow frame. Normal effect buffers survive.
   void handleOverlayDraw() override {
-    if (!_flashing) return;
-    if (_updating || realtimeMode != REALTIME_MODE_INACTIVE) {
-      stopFlash();
+    if (_screen == Screen::Idle) return;
+    if (!_enabled || _configPending || _textConfigPending || _updating || realtimeMode != REALTIME_MODE_INACTIVE
+        || strip.getLengthTotal() < MATRIX_WIDTH * MATRIX_HEIGHT) {
+      stopDisplay();
+      return;
+    }
+    const uint32_t now = millis();
+    if (_screen == Screen::Confirm) {
+      if (_phaseShown && uint32_t(now - _phaseStartedAt) >= PHASE_MS) {
+        if (++_phase >= PHASE_COUNT) {
+          stopDisplay();
+          return;
+        }
+        _phaseShown = false;
+      }
+      if (!_phaseShown) {
+        _phaseStartedAt = now;
+        _phaseShown = true;
+      }
+      strip.fill((_phase & 1) == 0 ? RGBW32(255, 0, 0, 0) : 0);
       return;
     }
 
-    const uint32_t now = millis();
-    if (_phaseShown && uint32_t(now - _phaseStartedAt) >= PHASE_MS) {
-      if (++_phase >= PHASE_COUNT) {
-        stopFlash();
-        return; // this frame already contains the original WLED display
+    if (_scrollShown && uint32_t(now - _scrollAt) >= scrollInterval()) {
+      --_scrollX;
+      const int16_t width = strlen(scrollingText()) * 6;
+      if (_scrollX <= -width) {
+        startScroll(_screen == Screen::Intro ? Screen::Browse : _screen);
       }
-      _phaseShown = false;
+      _scrollShown = false;
     }
-    if (!_phaseShown) {
-      _phaseStartedAt = now;
-      _phaseShown = true;
+    if (!_scrollShown) {
+      _scrollAt = now;
+      _scrollShown = true;
     }
-
-    // Cover every configured LED, including segment gaps. For the 8x8 matrix
-    // WLED must be configured for 64 LEDs; row wiring does not affect a fill.
-    // WLED still applies master brightness, gamma and its current limiter.
-    strip.fill((_phase & 1) == 0 ? RGBW32(255, 0, 0, 0) : 0);
+    drawText(scrollingText());
   }
 
   void onUpdateBegin(bool init) override {
     _updating = init;
-    stopFlash();
+    stopDisplay();
   }
 
   // WLED persists these values and builds the Usermods settings form from them.
@@ -145,6 +325,10 @@ public:
     JsonObject top = root.createNestedObject(FPSTR(NAME));
     top[FPSTR(ENABLED)] = _enabled;
     top[FPSTR(BUTTON_PIN)] = _buttonPin;
+    top["scroll-speed"] = _scrollSpeed;
+    saveTextScreen(top.createNestedObject("intro"), _intro);
+    saveTextScreen(top.createNestedObject("message1"), _messages[0]);
+    saveTextScreen(top.createNestedObject("message2"), _messages[1]);
   }
 
   // Validate before narrowing to int8_t; missing settings request default saving.
@@ -167,12 +351,32 @@ public:
     if (enabled != _enabled || pin != _buttonPin || _pinError) _configPending = true;
     _enabled = enabled;
     _buttonPin = static_cast<int8_t>(pin);
+    complete &= readTextScreen(top["intro"], _intro);
+    complete &= readTextScreen(top["message1"], _messages[0]);
+    complete &= readTextScreen(top["message2"], _messages[1]);
+    if (top["scroll-speed"].is<int>()) {
+      const int requested = top["scroll-speed"].as<int>();
+      const uint8_t speed = requested < 1 ? 1 : requested > 30 ? 30 : requested;
+      if (requested != speed) complete = false;
+      if (_scrollSpeed != speed) _textConfigPending = true;
+      _scrollSpeed = speed;
+    } else complete = false;
     return complete;
   }
 
   void appendConfigData() override {
     oappend(F("addInfo('CubeConnect:button-pin',1,'GPIO to GND button; -1 disables input. Use a free GPIO with an internal pull-up.');"));
-    oappend(F("addInfo('CubeConnect:enabled',1,'Three red flashes, 250 ms on / 250 ms off.');"));
+    oappend(F("addInfo('CubeConnect:enabled',1,'Hold 800 ms: open menu / confirm message. Click: next message.');"));
+    // Enhance WLED's generated fields, retaining their names and hidden type
+    // markers so normal form submission and persistence continue to work.
+    oappend(F("(()=>{const field=k=>Array.from(d.getElementsByName('CubeConnect:'+k)).find(e=>e.type!=='hidden');"
+      "for(const k of ['intro','message1','message2']){"
+      "const t=field(k+':text');if(t){t.maxLength=96;t.required=true;t.pattern='[ -~]{1,96}';t.title='1-96 printable ASCII characters';}"
+      "const c=field(k+':color');if(c){c.type='color';c.style.width='64px';c.style.height='36px';}}"
+      "const s=field('scroll-speed');if(s){s.type='range';s.min='1';s.max='30';s.step='1';"
+      "const out=d.createElement('output');out.setAttribute('aria-live','polite');"
+      "s.insertAdjacentElement('afterend',out);const update=()=>out.textContent=' '+s.value+' columns/s';"
+      "s.addEventListener('input',update);update();}})();"));
   }
 
   // WLED's Info dialog expects an array for each usermod information item.
@@ -186,7 +390,11 @@ public:
     else if (_allocatedPin < 0) status.add(F("Select button-pin in Config > Usermods"));
     else if (_updating) status.add(F("Firmware update in progress"));
     else if (realtimeMode != REALTIME_MODE_INACTIVE) status.add(F("Paused during realtime input"));
-    else status.add(_flashing ? F("Flashing") : F("Ready"));
+    else if (strip.getLengthTotal() < MATRIX_WIDTH * MATRIX_HEIGHT) status.add(F("Configure at least 64 LEDs"));
+    else if (_screen == Screen::Intro) status.add(F("Menu intro"));
+    else if (_screen == Screen::Browse) status.add(_message == 0 ? F("Message 1") : F("Message 2"));
+    else if (_screen == Screen::Confirm) status.add(F("Confirmation flashes (simulation)"));
+    else status.add(F("Ready - hold button for menu"));
   }
 
   uint16_t getId() override { return MOD_ID; }
