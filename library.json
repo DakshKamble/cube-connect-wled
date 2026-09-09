@@ -1,5 +1,5 @@
 {
-  "name": "wled-usermod-example",
+  "name": "cube-connect-usermod",
   "build": {
     "libArchive": false
   },
